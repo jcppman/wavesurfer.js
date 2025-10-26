@@ -233,6 +233,7 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     this.unsubscribeDestroy = this.once('destroy', micStream.onDestroy)
     this.unsubscribeRecordEnd = this.once('record-end', micStream.onEnd)
     this.stream = stream
+    this.isWaveformPaused = false
 
     return stream
   }
