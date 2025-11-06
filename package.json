@@ -58,6 +58,7 @@
     "build:dev": "tsc -w --target ESNext",
     "build": "npm run clean && tsc && rollup -c",
     "prepublishOnly": "npm run build",
+    "prepare": "npm run build",
     "lint": "eslint \"src/**/*.ts\" --fix",
     "lint:report": "eslint \"src/**/*.ts\" --output-file eslint_report.json --format json",
     "prettier": "prettier -w '**/*.{js,ts,css}' --ignore-path .gitignore",

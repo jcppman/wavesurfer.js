@@ -23,6 +23,12 @@ export type RecordPluginOptions = {
   continuousWaveformDuration?: number
   /** The timeslice to use for the media recorder */
   mediaRecorderTimeslice?: number
+  /** Whether to preserve the MediaStream across recordings (don't stop tracks), false by default */
+  preserveStream?: boolean
+  /** Optional MediaStream to use instead of calling getUserMedia internally */
+  mediaStream?: MediaStream
+  /** Optional AudioContext to use for audio processing. If not provided, a new one will be created and reused. */
+  audioContext?: AudioContext
 }
 
 export type RecordPluginDeviceOptions = MediaTrackConstraints
@@ -68,6 +74,9 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
   private unsubscribeDestroy?: () => void
   private unsubscribeRecordEnd?: () => void
   private recordedBlobUrl: string | null = null
+  private audioContext: AudioContext | null = null
+  private ownedAudioContext = false
+  private externalStream = false
 
   /** Create an instance of the Record plugin */
   constructor(options: RecordPluginOptions) {
@@ -79,9 +88,22 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
       continuousWaveform: options.continuousWaveform ?? false,
       renderRecordedAudio: options.renderRecordedAudio ?? true,
       mediaRecorderTimeslice: options.mediaRecorderTimeslice ?? undefined,
+      preserveStream: options.preserveStream ?? false,
     })
 
     this.timer = new Timer()
+
+    // Handle optional external AudioContext
+    if (options.audioContext) {
+      this.audioContext = options.audioContext
+      this.ownedAudioContext = false
+    }
+
+    // Handle optional external MediaStream
+    if (options.mediaStream) {
+      this.stream = options.mediaStream
+      this.externalStream = true
+    }
 
     this.subscriptions.push(
       this.timer.on('tick', () => {
@@ -98,7 +120,12 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
   }
 
   public renderMicStream(stream: MediaStream): MicStream {
-    const audioContext = new AudioContext()
+    // Reuse existing AudioContext or create a new one
+    if (!this.audioContext) {
+      this.audioContext = new AudioContext()
+      this.ownedAudioContext = true
+    }
+    const audioContext = this.audioContext
     const source = audioContext.createMediaStreamSource(stream)
     const analyser = audioContext.createAnalyser()
     source.connect(analyser)
@@ -200,7 +227,12 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     const cleanup = () => {
       clearInterval(intervalId)
       source?.disconnect()
-      audioContext?.close()
+      // Only close AudioContext if we created it (not externally provided)
+      if (this.ownedAudioContext && audioContext) {
+        audioContext.close()
+        this.audioContext = null
+        this.ownedAudioContext = false
+      }
     }
 
     return {
@@ -220,21 +252,56 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     }
 
     let stream: MediaStream
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: options ?? true,
-      })
-    } catch (err) {
-      throw new Error('Error accessing the microphone: ' + (err as Error).message)
+
+    // If stream already exists (from constructor), reuse it
+    if (this.stream) {
+      stream = this.stream
+    } else {
+      // Otherwise, call getUserMedia
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: options ?? true,
+        })
+      } catch (err) {
+        throw new Error('Error accessing the microphone: ' + (err as Error).message)
+      }
+      this.stream = stream
     }
 
     const micStream = this.renderMicStream(stream)
     this.micStream = micStream
     this.unsubscribeDestroy = this.once('destroy', micStream.onDestroy)
     this.unsubscribeRecordEnd = this.once('record-end', micStream.onEnd)
-    this.stream = stream
+
+    // Reset waveform paused flag to enable rendering
+    this.isWaveformPaused = false
 
     return stream
+  }
+
+  /** Set an external MediaStream to use for recording
+   * Useful for switching between different audio input devices
+   */
+  public setStream(stream: MediaStream): void {
+    // Stop previous micStream cleanup (intervals/nodes only)
+    if (this.micStream) {
+      this.micStream.onDestroy()
+      this.unsubscribeDestroy?.()
+      this.unsubscribeRecordEnd?.()
+    }
+
+    // Set new stream
+    this.stream = stream
+    this.externalStream = true
+
+    // Set up audio processing
+    const micStream = this.renderMicStream(stream)
+    this.micStream = micStream
+    this.unsubscribeDestroy = this.once('destroy', micStream.onDestroy)
+    this.unsubscribeRecordEnd = this.once('record-end', micStream.onEnd)
+
+    // Reset waveform paused flag to enable rendering
+    this.isWaveformPaused = false
   }
 
   /** Stop monitoring incoming audio */
@@ -246,7 +313,14 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     this.unsubscribeDestroy = undefined
     this.unsubscribeRecordEnd = undefined
     if (!this.stream) return
-    this.stream.getTracks().forEach((track) => track.stop())
+
+    // Only stop tracks if NOT preserved AND NOT external
+    const shouldStopTracks = !this.options.preserveStream && !this.externalStream
+
+    if (shouldStopTracks) {
+      this.stream.getTracks().forEach((track) => track.stop())
+    }
+
     this.stream = null
     this.mediaRecorder = null
   }
@@ -319,6 +393,21 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     return this.mediaRecorder?.state !== 'inactive'
   }
 
+  /** Pause live waveform rendering to save CPU when stream is preserved */
+  public pauseLiveWaveform(): void {
+    this.isWaveformPaused = true
+  }
+
+  /** Resume live waveform rendering */
+  public resumeLiveWaveform(): void {
+    this.isWaveformPaused = false
+  }
+
+  /** Check if live waveform rendering is paused */
+  public isLiveWaveformPaused(): boolean {
+    return this.isWaveformPaused
+  }
+
   /** Stop the recording */
   public stopRecording() {
     if (this.isActive()) {
@@ -365,7 +454,21 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     this.applyOriginalOptionsIfNeeded()
     super.destroy()
     this.stopRecording()
+
+    // Always stop tracks on destroy (even if preserved or external)
+    if (this.stream && !this.externalStream) {
+      this.stream.getTracks().forEach((track) => track.stop())
+    }
+
     this.stopMic()
+
+    // Only close AudioContext if we created it (not externally provided)
+    if (this.audioContext && this.ownedAudioContext) {
+      this.audioContext.close()
+      this.audioContext = null
+      this.ownedAudioContext = false
+    }
+
     // Revoke blob URL to free memory
     if (this.recordedBlobUrl) {
       URL.revokeObjectURL(this.recordedBlobUrl)
