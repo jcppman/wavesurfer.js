@@ -239,7 +239,10 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
       onDestroy: cleanup,
       onEnd: () => {
         this.isWaveformPaused = true
-        this.stopMic()
+        // Only stop mic if stream is not being preserved
+        if (!this.options.preserveStream) {
+          this.stopMic()
+        }
       },
     }
   }
