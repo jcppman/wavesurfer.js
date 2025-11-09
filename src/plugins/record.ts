@@ -317,8 +317,8 @@ class RecordPlugin extends BasePlugin<RecordPluginEvents, RecordPluginOptions> {
     this.unsubscribeRecordEnd = undefined
     if (!this.stream) return
 
-    // Only stop tracks if NOT preserved AND NOT external
-    const shouldStopTracks = !this.options.preserveStream && !this.externalStream
+    // Stop tracks for internal streams, even when preserveStream was enabled
+    const shouldStopTracks = !this.externalStream
 
     if (shouldStopTracks) {
       this.stream.getTracks().forEach((track) => track.stop())
